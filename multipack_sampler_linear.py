@@ -1,4 +1,5 @@
 from typing import Optional, List
+import math
 
 import torch.distributed as dist
 from torch.utils.data import Sampler
@@ -8,79 +9,85 @@ import numba
 
 
 @numba.njit
-def lpt_check(heap: np.ndarray, A: np.ndarray, c: int, n: int):
-    # LPT (Longest processing time first scheduling)
-    # Time: O(|A| log |A| + |A| log n)
+def ffd_check(work: np.ndarray, a: np.ndarray, c: int, n: int, nbits: int):
+    # First-fit-decreasing bin packing
+    # Check if a[] could fit in n bins with capacity c
+    # https://en.wikipedia.org/wiki/First-fit-decreasing_bin_packing
 
-    A = np.sort(A)[::-1]
-    heap.fill(0)
-    for size in A:
-        # Put into smallest element
-        heap[1] += size
-        if heap[1] > c:
+    a = np.sort(a)[::-1]
+
+    valid_size = (1 << nbits) + n
+    work[:valid_size] = c
+    for size in a:
+        # Find the branch
+        u = 1
+        for i in range(nbits):
+            lch = u << 1
+            rch = (u << 1) | 1
+            if work[lch] >= size:
+                u = lch
+            else:
+                u = rch
+
+        if u >= valid_size or work[u] < size:
             return False
 
-        # Heapify (Sink)
-        # https://stackoverflow.com/questions/20397674/replacing-element-in-min-heap
-        u = 1
-        while (u << 1) <= n:
-            v = u << 1  # lch
-            rch = (u << 1) | 1
-            if rch <= n and heap[rch] < heap[v]:
-                v = rch
-            
-            if heap[u] <= heap[v]:
-                break
+        # Update
+        work[u] -= size
+        for i in range(nbits - 1):  # Root not needed
+            u = u >> 1
 
-            heap[u], heap[v] = heap[v], heap[u]
-            u = v
+            work[u] = max(work[u << 1], work[(u << 1) | 1])
 
     return True
 
 
 @numba.njit
-def lpt_with_result(heap: np.ndarray, A: np.ndarray, n: int, start_index: int, rank: int):
-    # LPT (Longest processing time first scheduling)
-    # Time: O(|A| log |A| + |A| log n)
+def ffd_with_result(work: np.ndarray, a: np.ndarray, c: int, n: int, nbits: int, start_index: int):
+    # First-fit-decreasing bin packing (with result return)
+    indices = np.argsort(a)[::-1]
+    a = a[indices]
 
-    result = []
+    bins_result = []
+    base = 1 << nbits
 
-    indices = np.argsort(A)[::-1]
-    A = A[indices]
-
-    heap.fill(0)
-    heap_id = np.arange(-1, n, dtype=A.dtype)
-    for idx, size in enumerate(A):
-        # Put into smallest element
-        heap[1] += size
-        if heap_id[1] == rank:
-            result.append(start_index + indices[idx])
-
-        # Heapify (Sink)
-        # https://stackoverflow.com/questions/20397674/replacing-element-in-min-heap
+    valid_size = (1 << nbits) + n
+    work[:valid_size] = c
+    for idx, size in enumerate(a):
+        # Find the branch
         u = 1
-        while (u << 1) <= n:
-            v = u << 1  # lch
+        for i in range(nbits):
+            lch = u << 1
             rch = (u << 1) | 1
-            if rch <= n and heap[rch] < heap[v]:
-                v = rch
-            
-            if heap[u] <= heap[v]:
-                break
+            if work[lch] >= size:
+                u = lch
+            else:
+                u = rch
 
-            heap[u], heap[v] = heap[v], heap[u]
-            heap_id[u], heap_id[v] = heap_id[v], heap_id[u]
-            u = v
+        bin_id = u - base
+        if bin_id >= len(bins_result):
+            bins_result.append([start_index + indices[idx]])
+        else:
+            bins_result[bin_id].append(start_index + indices[idx])
 
-    return result
+        # Update
+        work[u] -= size
+        for i in range(nbits - 1):  # Root not needed
+            u = u >> 1
+
+            work[u] = max(work[u << 1], work[(u << 1) | 1])
+
+    return bins_result
 
 
 @numba.njit
 def allocate(lengths: np.ndarray, lengths_cumsum: np.ndarray, rank: int, c: int, n: int):
-    # Dynamic batch allocator, binary search + LPT
+    # Dynamic batch allocator, similar to Multifit
+    # https://en.wikipedia.org/wiki/Multifit_algorithm
     # ~99.5% efficiency on OpenChat training set (12 * 2048 ctx len)
 
-    heap = np.zeros(n + 1, dtype=lengths.dtype)
+    nbits = int(math.ceil(math.log2(n)))
+    work = np.zeros((1 << (nbits + 1), ), dtype=lengths.dtype)
 
     s = 0
     start_index = 0
@@ -93,34 +100,31 @@ def allocate(lengths: np.ndarray, lengths_cumsum: np.ndarray, rank: int, c: int,
 
         while r - l > 1:
             m = (l + r) // 2
-            if lpt_check(heap, lengths[start_index: start_index + m], c, n):
+            if ffd_check(work, lengths[start_index: start_index + m], c, n, nbits):
                 l = m
             else:
                 r = m
 
         # use length l
-        if l < n:
-            break  # Can't allocate each sequence to a single machine
-
-        batch = lpt_with_result(heap, lengths[start_index: start_index + l], n, start_index, rank)
+        batch = ffd_with_result(work, lengths[start_index: start_index + l], c, n, nbits, start_index)
+        assert len(batch) <= n
+        if len(batch) < n:
+            break
 
         start_index += l
         s = lengths_cumsum[start_index - 1]
 
         # add local rank
-        result.append(batch)
+        result.append(batch[rank])
 
     return result, s, len(result) * c * n
 
 
-class MultipackDistributedBatchSampler(Sampler):
-    """Unpadded length sampling using Multipack V2, for models with quadratic attention complexity.
-       It also tries to evenly distribute the sequences using LPT, so that quadratic load is more balanced.
-
-       Approximate (at most 1.33x ?) the optimal solution of the identical-machines scheduling problem, which is NP-hard.
-
-       Time Complexity: O(n log n log k)
-       n = maximum number of sequences per batch, k = number of nodes
+class MultipackDistributedBatchSampler_LinearAttention(Sampler):
+    """Unpadded length sampling using Multipack for models with linear attention complexity.
+       WARNING: This algorithm might put most long sequences into one node, causing significant lag if attention complexity is quadratic.
+       
+       Approximate (at most 1.22x ?) the optimal solution of the identical-machines scheduling problem, which is NP-hard.
     """
 
     def __init__(
@@ -159,7 +163,7 @@ class MultipackDistributedBatchSampler(Sampler):
         self.epoch = epoch
 
     def generate_batches(self, set_stats=False):
-        indices = np.random.Generator(np.random.Philox(seed=self.seed + self.epoch)).permutation(len(self.lengths))
+        indices = np.random.default_rng(seed=self.seed + self.epoch).permutation(len(self.lengths))
 
         lengths = self.lengths[indices]
         lengths_cumsum = np.cumsum(lengths)
